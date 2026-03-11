@@ -1,0 +1,20 @@
+[package]
+name = "dissectlm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5.0"
+indicatif = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+safetensors = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["macros", "process", "rt-multi-thread", "fs"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+httpmock = "0.7"
+tempfile = "3.12"
