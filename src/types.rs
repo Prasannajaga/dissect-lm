@@ -21,6 +21,7 @@ pub enum LayerCategory {
     FeedForward,
     Embedding,
     Normalization,
+    OutputHead,
     Other,
 }
 
@@ -40,6 +41,7 @@ pub struct CategoryTotals {
     pub feedforward: u64,
     pub embedding: u64,
     pub normalization: u64,
+    pub output_head: u64,
     pub other: u64,
 }
 

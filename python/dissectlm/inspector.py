@@ -51,12 +51,69 @@ def inspect_model(model: str) -> Dict[str, Any]:
     return out
 
 
+def inspect_checkpoint(checkpoint: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "mode": "deep",
+        "checkpoint": checkpoint,
+        "frameworks": {},
+    }
+
+    try:
+        import torch  # type: ignore
+
+        out["frameworks"]["torch"] = torch.__version__
+        data = torch.load(checkpoint, map_location="cpu")
+
+        payload = data
+        if isinstance(data, dict):
+            if "state_dict" in data and isinstance(data["state_dict"], dict):
+                payload = data["state_dict"]
+            elif "model" in data and isinstance(data["model"], dict):
+                payload = data["model"]
+
+        if isinstance(payload, dict):
+            tensor_items = []
+            total_params = 0
+            for key, value in payload.items():
+                shape = tuple(getattr(value, "shape", ()))
+                if not shape:
+                    continue
+                params = 1
+                for dim in shape:
+                    params *= int(dim)
+                total_params += params
+                tensor_items.append((str(key), list(shape), params))
+
+            tensor_items.sort(key=lambda x: x[2], reverse=True)
+            out["checkpoint_summary"] = {
+                "tensor_count": len(tensor_items),
+                "total_params": total_params,
+                "top_tensors": [
+                    {"name": name, "shape": shape, "params": params}
+                    for name, shape, params in tensor_items[:20]
+                ],
+            }
+        else:
+            out["checkpoint_summary"] = {
+                "note": f"Unsupported checkpoint payload type: {type(payload).__name__}"
+            }
+    except Exception as exc:  # pragma: no cover
+        out["frameworks"]["torch"] = f"error: {exc}"
+
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deep model inspector")
-    parser.add_argument("--model", required=True)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--model")
+    group.add_argument("--checkpoint")
     args = parser.parse_args()
 
-    print(json.dumps(inspect_model(args.model)))
+    if args.checkpoint:
+        print(json.dumps(inspect_checkpoint(args.checkpoint)))
+    else:
+        print(json.dumps(inspect_model(args.model)))
 
 
 if __name__ == "__main__":

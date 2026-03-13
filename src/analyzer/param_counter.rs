@@ -1,4 +1,4 @@
-use crate::analyzer::classifier::classify_tensor;
+use crate::analyzer::classifier::classify_tensor_for_model;
 use crate::analyzer::safetensor::TensorMetaRaw;
 use crate::types::{
     ArchitectureInfo, AttentionInfo, CategoryTotals, LayerCategory, ParamStats, TensorMeta,
@@ -20,7 +20,7 @@ pub fn summarize_tensors(
 
     for raw in raw_tensors {
         let param_count = param_count_from_shape(&raw.shape);
-        let category = classify_tensor(&raw.name);
+        let category = classify_tensor_for_model(&raw.name, architecture.model_type.as_deref());
 
         match category {
             LayerCategory::Attention => {
@@ -34,6 +34,9 @@ pub fn summarize_tensors(
             }
             LayerCategory::Normalization => {
                 categories.normalization = categories.normalization.saturating_add(param_count)
+            }
+            LayerCategory::OutputHead => {
+                categories.output_head = categories.output_head.saturating_add(param_count)
             }
             LayerCategory::Other => categories.other = categories.other.saturating_add(param_count),
         }
@@ -151,6 +154,7 @@ mod tests {
             tensor("model.layers.0.mlp.up_proj.weight", &[8, 16]),
             tensor("model.embed_tokens.weight", &[128, 8]),
             tensor("model.norm.weight", &[8]),
+            tensor("lm_head.weight", &[128, 8]),
         ];
 
         let arch = ArchitectureInfo {
@@ -164,6 +168,7 @@ mod tests {
         assert_eq!(stats.categories.feedforward, 128);
         assert_eq!(stats.categories.embedding, 1024);
         assert_eq!(stats.categories.normalization, 8);
+        assert_eq!(stats.categories.output_head, 1024);
         assert_eq!(attention.kv_heads, Some(2));
         assert_eq!(attention.attention_type.as_deref(), Some("GQA"));
     }

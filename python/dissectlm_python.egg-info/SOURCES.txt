@@ -1,0 +1,10 @@
+pyproject.toml
+dissectlm/__init__.py
+dissectlm/inspector.py
+dissectlm/tf_inspector.py
+dissectlm/torch_inspector.py
+dissectlm_python.egg-info/PKG-INFO
+dissectlm_python.egg-info/SOURCES.txt
+dissectlm_python.egg-info/dependency_links.txt
+dissectlm_python.egg-info/requires.txt
+dissectlm_python.egg-info/top_level.txt

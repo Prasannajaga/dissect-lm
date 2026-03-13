@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use indicatif::ProgressBar;
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -25,6 +27,7 @@ pub struct InspectOptions {
     pub show_attention_breakdown: bool,
     pub deep: bool,
     pub json: bool,
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,10 +62,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         None => {
-            let model = cli
-                .model
-                .as_deref()
-                .context("model is required when no subcommand is used")?;
+            let model_owned = cli.model.clone().or(cli.checkpoint.clone()).context(
+                "model is required when no subcommand is used (or provide --checkpoint with --deep)",
+            )?;
+            let model = model_owned.as_str();
 
             let options = InspectOptions {
                 show_params: cli.params,
@@ -70,6 +73,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 show_attention_breakdown: cli.attention_breakdown,
                 deep: cli.deep,
                 json: cli.json,
+                checkpoint: cli.checkpoint.clone(),
             };
 
             let report = inspect_model(model, &options).await?;
@@ -89,8 +93,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<ModelReport> {
+    let mut spinner = LoadingSpinner::start(format!("Inspecting {model}"));
+    spinner.set_message("Resolving model source...");
     let mut resolved = resolve_input(model).await?;
 
+    spinner.set_message("Analyzing metadata...");
     let mut architecture = match &resolved.config {
         Some(cfg) => architecture_from_config(cfg),
         None => ArchitectureInfo::default(),
@@ -103,13 +110,22 @@ pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<Mode
     }
 
     let graph = if options.show_graph {
+        spinner.set_message("Building architecture graph...");
         Some(build_architecture_graph(&architecture))
     } else {
         None
     };
 
     let deep = if options.deep {
-        Some(run_deep_inspection(model).await?)
+        spinner.set_message("Running deep inspection...");
+        Some(
+            run_deep_inspection(
+                model,
+                options.checkpoint.as_deref(),
+                Some(spinner.progress_bar()),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -125,7 +141,7 @@ pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<Mode
         attention_info.attention_type = architecture.attention_type.clone();
     }
 
-    Ok(ModelReport {
+    let report = ModelReport {
         model: model.to_string(),
         source: resolved.source,
         architecture,
@@ -140,7 +156,10 @@ pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<Mode
         graph,
         deep,
         warnings: resolved.warnings,
-    })
+    };
+
+    spinner.finish("Inspection complete");
+    Ok(report)
 }
 
 pub async fn compare_models(
@@ -229,6 +248,11 @@ pub async fn compare_models(
             pct_string(left.params.pct(left.params.categories.normalization)),
             pct_string(right.params.pct(right.params.categories.normalization)),
         ),
+        diff_metric(
+            "OutputHead %",
+            pct_string(left.params.pct(left.params.categories.output_head)),
+            pct_string(right.params.pct(right.params.categories.output_head)),
+        ),
     ];
 
     Ok(CompareReport { left, right, diffs })
@@ -254,6 +278,44 @@ fn opt_string(value: Option<String>) -> String {
 
 fn pct_string(value: f64) -> String {
     format!("{value:.1}%")
+}
+
+struct LoadingSpinner {
+    pb: ProgressBar,
+    finished: bool,
+}
+
+impl LoadingSpinner {
+    fn start(message: String) -> Self {
+        let pb = ProgressBar::new_spinner();
+        pb.enable_steady_tick(Duration::from_millis(100));
+        pb.set_message(message);
+        Self {
+            pb,
+            finished: false,
+        }
+    }
+
+    fn set_message(&self, message: &str) {
+        self.pb.set_message(message.to_string());
+    }
+
+    fn progress_bar(&self) -> ProgressBar {
+        self.pb.clone()
+    }
+
+    fn finish(&mut self, message: &str) {
+        self.finished = true;
+        self.pb.finish_with_message(message.to_string());
+    }
+}
+
+impl Drop for LoadingSpinner {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.pb.finish_and_clear();
+        }
+    }
 }
 
 async fn resolve_input(model: &str) -> Result<ResolvedInput> {

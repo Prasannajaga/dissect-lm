@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: dissectlm-python
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: transformers>=4.40
+Requires-Dist: torch>=2.2
+Requires-Dist: tensorflow>=2.15

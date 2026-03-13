@@ -17,16 +17,23 @@ pub struct Cli {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    #[arg(long, requires = "model")]
+    #[arg(long, value_name = "PATH", requires = "deep")]
+    pub checkpoint: Option<String>,
+
+    #[arg(long, requires = "model", conflicts_with = "checkpoint")]
     pub params: bool,
 
-    #[arg(long, requires = "model")]
+    #[arg(long, requires = "model", conflicts_with = "checkpoint")]
     pub graph: bool,
 
-    #[arg(long = "attention-breakdown", requires = "model")]
+    #[arg(
+        long = "attention-breakdown",
+        requires = "model",
+        conflicts_with = "checkpoint"
+    )]
     pub attention_breakdown: bool,
 
-    #[arg(long, requires = "model")]
+    #[arg(long)]
     pub deep: bool,
 }
 

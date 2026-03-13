@@ -1,25 +1,35 @@
 use anyhow::{Context, Result, bail};
+use indicatif::ProgressBar;
 use serde_json::Value;
+use std::process::Stdio;
+use std::time::Instant;
 use tokio::process::Command;
+use tokio::time::{Duration, sleep};
 
-pub async fn run_deep_inspection(model: &str) -> Result<Value> {
+pub async fn run_deep_inspection(
+    model: &str,
+    checkpoint: Option<&str>,
+    progress: Option<ProgressBar>,
+) -> Result<Value> {
     let uv_bin = std::env::var("DISSECTLM_UV_BIN").unwrap_or_else(|_| "uv".to_string());
 
-    let output = Command::new(&uv_bin)
-        .args([
-            "run",
-            "--project",
-            "python",
-            "python",
-            "-m",
-            "dissectlm.inspector",
-            "--model",
-            model,
-        ])
-        .output()
-        .await;
+    let mut cmd = Command::new(&uv_bin);
+    cmd.args([
+        "run",
+        "--project",
+        "python",
+        "python",
+        "-m",
+        "dissectlm.inspector",
+    ]);
+    if let Some(path) = checkpoint {
+        cmd.args(["--checkpoint", path]);
+    } else {
+        cmd.args(["--model", model]);
+    }
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
 
-    let output = match output {
+    let mut child = match child {
         Ok(v) => v,
         Err(err) => {
             bail!(
@@ -27,6 +37,32 @@ pub async fn run_deep_inspection(model: &str) -> Result<Value> {
             )
         }
     };
+
+    let started = Instant::now();
+    if let Some(pb) = &progress {
+        pb.set_message("Running deep inspection... 0s elapsed".to_string());
+    }
+
+    loop {
+        match child
+            .try_wait()
+            .context("failed while polling deep inspection process")?
+        {
+            Some(_) => break,
+            None => {
+                if let Some(pb) = &progress {
+                    let elapsed = started.elapsed().as_secs();
+                    pb.set_message(format!("Running deep inspection... {elapsed}s elapsed"));
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to collect deep inspection output")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -54,7 +90,7 @@ mod tests {
             std::env::set_var("DISSECTLM_UV_BIN", "definitely_missing_uv_binary");
         }
 
-        let result = run_deep_inspection("gpt2").await;
+        let result = run_deep_inspection("gpt2", None, None).await;
         let msg = result.expect_err("expected error").to_string();
         assert!(msg.contains("uv sync --project python"));
 

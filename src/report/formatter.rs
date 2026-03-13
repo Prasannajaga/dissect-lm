@@ -1,4 +1,9 @@
+use console::style;
+
 use crate::types::{CompareReport, ModelReport};
+
+const PANEL_WIDTH: usize = 96;
+const BAR_WIDTH: usize = 24;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
@@ -10,128 +15,152 @@ pub struct RenderOptions {
 pub fn render_model(report: &ModelReport, options: &RenderOptions) -> String {
     let mut out = String::new();
 
-    out.push_str("MODEL SUMMARY\n");
-    out.push_str("────────────────────────\n\n");
-    out.push_str(&format!("Model: {}\n", report.model));
-    out.push_str(&format!("Source: {}\n", report.source.location));
     out.push_str(&format!(
-        "Total params: {}\n\n",
-        human_params(report.params.total_params)
+        "{}\n{}\n\n",
+        style("DISSECTLM MODEL REPORT").bold().cyan(),
+        style("=".repeat(PANEL_WIDTH)).dim()
     ));
 
-    out.push_str("Layer distribution\n\n");
-    out.push_str(&format_layer_row(
-        "FeedForward",
-        report.params.categories.feedforward,
-        report.params.pct(report.params.categories.feedforward),
-    ));
-    out.push_str(&format_layer_row(
-        "Attention",
-        report.params.categories.attention,
-        report.params.pct(report.params.categories.attention),
-    ));
-    out.push_str(&format_layer_row(
-        "Embedding",
-        report.params.categories.embedding,
-        report.params.pct(report.params.categories.embedding),
-    ));
-    out.push_str(&format_layer_row(
-        "Normalization",
-        report.params.categories.normalization,
-        report.params.pct(report.params.categories.normalization),
-    ));
-    out.push_str(&format_layer_row(
-        "Other",
-        report.params.categories.other,
-        report.params.pct(report.params.categories.other),
+    let summary_rows = vec![
+        ("Model", report.model.clone()),
+        ("Source", report.source.location.clone()),
+        ("Total params", human_params(report.params.total_params)),
+        ("Tensors indexed", report.tensor_count.to_string()),
+    ];
+    out.push_str(&kv_panel("Summary", &summary_rows));
+
+    let distribution_rows = vec![
+        (
+            "FeedForward",
+            report.params.categories.feedforward,
+            report.params.pct(report.params.categories.feedforward),
+        ),
+        (
+            "Attention",
+            report.params.categories.attention,
+            report.params.pct(report.params.categories.attention),
+        ),
+        (
+            "Embedding",
+            report.params.categories.embedding,
+            report.params.pct(report.params.categories.embedding),
+        ),
+        (
+            "Normalization",
+            report.params.categories.normalization,
+            report.params.pct(report.params.categories.normalization),
+        ),
+        (
+            "OutputHead",
+            report.params.categories.output_head,
+            report.params.pct(report.params.categories.output_head),
+        ),
+        (
+            "Other",
+            report.params.categories.other,
+            report.params.pct(report.params.categories.other),
+        ),
+    ];
+    out.push_str(&distribution_panel(
+        "Layer Distribution",
+        &distribution_rows,
     ));
 
-    out.push_str("\nArchitecture\n\n");
-    out.push_str(&format!(
-        "Layers: {}\n",
-        opt_u64(report.architecture.num_layers)
-    ));
-    out.push_str(&format!(
-        "Hidden size: {}\n",
-        opt_u64(report.architecture.hidden_size)
-    ));
-    out.push_str(&format!(
-        "Heads: {}\n",
-        opt_u64(report.architecture.num_heads)
-    ));
-    out.push_str(&format!(
-        "KV heads: {}\n",
-        opt_u64(
+    let architecture_rows = vec![
+        ("Layers", opt_u64(report.architecture.num_layers)),
+        ("Hidden size", opt_u64(report.architecture.hidden_size)),
+        ("Heads", opt_u64(report.architecture.num_heads)),
+        (
+            "KV heads",
+            opt_u64(
+                report
+                    .architecture
+                    .num_key_value_heads
+                    .or(report.attention.kv_heads),
+            ),
+        ),
+        (
+            "Attention type",
             report
                 .architecture
-                .num_key_value_heads
-                .or(report.attention.kv_heads)
-        )
-    ));
-    out.push_str(&format!(
-        "Attention: {}\n",
-        report
-            .architecture
-            .attention_type
-            .as_deref()
-            .or(report.attention.attention_type.as_deref())
-            .unwrap_or("-")
-    ));
+                .attention_type
+                .as_deref()
+                .or(report.attention.attention_type.as_deref())
+                .unwrap_or("-")
+                .to_string(),
+        ),
+    ];
+    out.push_str(&kv_panel("Architecture", &architecture_rows));
 
     if options.show_attention_breakdown {
-        out.push_str("\nAttention breakdown\n\n");
-        out.push_str(&format!(
-            "Q proj params: {}\n",
-            human_params(report.attention.q_proj_params)
-        ));
-        out.push_str(&format!(
-            "K proj params: {}\n",
-            human_params(report.attention.k_proj_params)
-        ));
-        out.push_str(&format!(
-            "V proj params: {}\n",
-            human_params(report.attention.v_proj_params)
-        ));
-        out.push_str(&format!(
-            "O proj params: {}\n",
-            human_params(report.attention.o_proj_params)
-        ));
+        let attn_rows = vec![
+            (
+                "Q proj params",
+                human_params(report.attention.q_proj_params),
+            ),
+            (
+                "K proj params",
+                human_params(report.attention.k_proj_params),
+            ),
+            (
+                "V proj params",
+                human_params(report.attention.v_proj_params),
+            ),
+            (
+                "O proj params",
+                human_params(report.attention.o_proj_params),
+            ),
+        ];
+        out.push_str(&kv_panel("Attention Breakdown", &attn_rows));
     }
 
     if options.show_graph {
-        out.push_str("\nArchitecture graph\n\n");
-        out.push_str(report.graph.as_deref().unwrap_or("Graph unavailable"));
-        out.push('\n');
+        let graph = report
+            .graph
+            .as_deref()
+            .unwrap_or("Graph unavailable")
+            .lines()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        out.push_str(&text_panel("Architecture Graph", &graph));
     }
 
     if options.show_params {
-        out.push_str("\nTensor stats\n\n");
-        out.push_str(&format!("Tensors indexed: {}\n", report.tensor_count));
-        out.push_str("Top tensors by parameter count:\n");
+        let mut lines = Vec::new();
+        lines.push(format!("{:<4} {:<62} {:>14}", "#", "Tensor", "Params"));
+        lines.push("-".repeat(PANEL_WIDTH - 6));
 
         if let Some(tensors) = &report.tensors {
             let mut sorted = tensors.clone();
             sorted.sort_by(|a, b| b.param_count.cmp(&a.param_count));
-            for tensor in sorted.iter().take(20) {
-                out.push_str(&format!(
-                    "{:<60} {:>12}\n",
-                    truncate(&tensor.name, 60),
+            for (idx, tensor) in sorted.iter().take(20).enumerate() {
+                lines.push(format!(
+                    "{:<4} {:<62} {:>14}",
+                    idx + 1,
+                    truncate(&tensor.name, 62),
                     human_params(tensor.param_count)
                 ));
             }
         }
+
+        out.push_str(&text_panel("Top Tensors", &lines));
     }
 
     if let Some(deep) = &report.deep {
-        out.push_str("\nDeep inspection\n\n");
-        out.push_str(&format!("{}\n", deep));
+        let deep_lines = vec![deep.to_string()];
+        out.push_str(&text_panel("Deep Inspection", &deep_lines));
     }
 
     if !report.warnings.is_empty() {
-        out.push_str("\nWarnings\n\n");
-        for w in &report.warnings {
-            out.push_str(&format!("- {w}\n"));
-        }
+        let warning_lines = report
+            .warnings
+            .iter()
+            .map(|w| format!("! {w}"))
+            .collect::<Vec<_>>();
+        out.push_str(&text_panel(
+            &format!("{}", style("Warnings").yellow().bold()),
+            &warning_lines,
+        ));
     }
 
     out
@@ -139,23 +168,93 @@ pub fn render_model(report: &ModelReport, options: &RenderOptions) -> String {
 
 pub fn render_compare(report: &CompareReport) -> String {
     let mut out = String::new();
-    out.push_str("MODEL COMPARISON\n");
-    out.push_str("────────────────────────\n\n");
-    out.push_str(&format!("Left:  {}\n", report.left.model));
-    out.push_str(&format!("Right: {}\n\n", report.right.model));
+    out.push_str(&format!(
+        "{}\n{}\n\n",
+        style("DISSECTLM MODEL COMPARISON").bold().magenta(),
+        style("=".repeat(PANEL_WIDTH)).dim()
+    ));
 
+    let header_rows = vec![
+        ("Left", report.left.model.clone()),
+        ("Right", report.right.model.clone()),
+    ];
+    out.push_str(&kv_panel("Models", &header_rows));
+
+    let mut lines = Vec::new();
+    lines.push(format!("{:<22} {:<26} {:<26}", "Metric", "Left", "Right"));
+    lines.push("-".repeat(PANEL_WIDTH - 6));
     for diff in &report.diffs {
-        out.push_str(&format!(
-            "{:<14} {} -> {}\n",
-            diff.metric, diff.left, diff.right
+        lines.push(format!(
+            "{:<22} {:<26} {:<26}",
+            truncate(&diff.metric, 22),
+            truncate(&diff.left, 26),
+            truncate(&diff.right, 26)
         ));
     }
+    out.push_str(&text_panel("Comparison", &lines));
 
     out
 }
 
-fn format_layer_row(name: &str, value: u64, pct: f64) -> String {
-    format!("{:<14} {:>6.1}% ({})\n", name, pct, human_params(value))
+fn kv_panel(title: &str, rows: &[(&str, String)]) -> String {
+    let lines = rows
+        .iter()
+        .map(|(k, v)| format!("{:<20} {}", k, v))
+        .collect::<Vec<_>>();
+    text_panel(title, &lines)
+}
+
+fn distribution_panel(title: &str, rows: &[(&str, u64, f64)]) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{:<14} {:>8} {:>14}  {:<24}",
+        "Category", "Share", "Params", "Distribution"
+    ));
+    lines.push("-".repeat(PANEL_WIDTH - 6));
+
+    for (name, count, pct) in rows {
+        lines.push(format!(
+            "{:<14} {:>7.1}% {:>14}  {}",
+            name,
+            pct,
+            human_params(*count),
+            pct_bar(*pct)
+        ));
+    }
+
+    text_panel(title, &lines)
+}
+
+fn text_panel(title: &str, lines: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("┌{}┐\n", "─".repeat(PANEL_WIDTH - 2)));
+    out.push_str(&format!(
+        "│ {:<width$} │\n",
+        format!("[ {} ]", title),
+        width = PANEL_WIDTH - 4
+    ));
+    out.push_str(&format!("├{}┤\n", "─".repeat(PANEL_WIDTH - 2)));
+
+    for line in lines {
+        for wrapped in wrap_line(line, PANEL_WIDTH - 4) {
+            out.push_str(&format!(
+                "│ {:<width$} │\n",
+                wrapped,
+                width = PANEL_WIDTH - 4
+            ));
+        }
+    }
+
+    out.push_str(&format!("└{}┘\n\n", "─".repeat(PANEL_WIDTH - 2)));
+    out
+}
+
+fn pct_bar(pct: f64) -> String {
+    let clamped = pct.clamp(0.0, 100.0);
+    let filled = ((clamped / 100.0) * BAR_WIDTH as f64).round() as usize;
+    let filled = filled.min(BAR_WIDTH);
+    let empty = BAR_WIDTH.saturating_sub(filled);
+    format!("{}{}", "#".repeat(filled), ".".repeat(empty))
 }
 
 fn human_params(value: u64) -> String {
@@ -189,7 +288,47 @@ fn truncate(s: &str, max_len: usize) -> String {
         return s.to_string();
     }
 
-    let mut out = s.chars().take(max_len - 1).collect::<String>();
-    out.push('…');
+    let mut out = s
+        .chars()
+        .take(max_len.saturating_sub(1))
+        .collect::<String>();
+    out.push('~');
     out
+}
+
+fn wrap_line(s: &str, width: usize) -> Vec<String> {
+    if s.chars().count() <= width {
+        return vec![s.to_string()];
+    }
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+
+    for word in s.split_whitespace() {
+        let candidate_len = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+
+        if candidate_len > width && !current.is_empty() {
+            out.push(current);
+            current = word.to_string();
+        } else if current.is_empty() {
+            current.push_str(word);
+        } else {
+            current.push(' ');
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    if out.is_empty() {
+        vec![truncate(s, width)]
+    } else {
+        out
+    }
 }
