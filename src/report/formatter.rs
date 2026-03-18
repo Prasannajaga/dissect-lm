@@ -49,7 +49,7 @@ pub fn render_model(report: &ModelReport, options: &RenderOptions) -> String {
         ("Source kind".to_string(), source_kind_label(&report.source.kind)),
         ("Source".to_string(), report.source.location.clone()),
         (
-            "Total params".to_string(),
+            "Total params (excl head)".to_string(),
             human_params(report.params.total_params),
         ),
         (
@@ -148,15 +148,7 @@ pub fn render_model(report: &ModelReport, options: &RenderOptions) -> String {
         ),
     ];
     if let Some(config) = &report.config {
-        if let Some(obj) = config.as_object() {
-            let mut keys = obj.keys().collect::<Vec<_>>();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = obj.get(key) {
-                    architecture_rows.push((format!("cfg.{key}"), format_config_value(value)));
-                }
-            }
-        }
+        architecture_rows.extend(flatten_config_fields("cfg", config));
     }
     out.push_str(&kv_panel("Architecture", &architecture_rows, &layout));
 
@@ -342,9 +334,36 @@ fn kv_panel(title: &str, rows: &[(String, String)], layout: &RenderLayout) -> St
     text_panel(title, &lines, layout)
 }
 
-fn format_config_value(value: &Value) -> String {
+fn flatten_config_fields(prefix: &str, value: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    flatten_config_fields_inner(prefix, value, &mut out);
+    out
+}
+
+fn flatten_config_fields_inner(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(v) = map.get(key) {
+                    flatten_config_fields_inner(&format!("{prefix}.{key}"), v, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for (idx, v) in arr.iter().enumerate() {
+                flatten_config_fields_inner(&format!("{prefix}[{idx}]"), v, out);
+            }
+        }
+        _ => out.push((prefix.to_string(), format_config_leaf(value))),
+    }
+}
+
+fn format_config_leaf(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
         _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
     }
 }

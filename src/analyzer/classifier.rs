@@ -122,6 +122,10 @@ fn is_feedforward(name: &str) -> bool {
 
 fn is_embedding(name: &str) -> bool {
     name.contains("embed")
+        || name.contains("token_emb")
+        || name.contains("tok_emb")
+        || name.contains("token_embedding")
+        || name.contains("input_embedding")
         || name.contains("wte")
         || name.contains("tok_embeddings")
         || name.contains("embed_tokens")
@@ -151,6 +155,10 @@ mod tests {
         );
         assert_eq!(
             classify_tensor("model.embed_tokens.weight"),
+            LayerCategory::Embedding
+        );
+        assert_eq!(
+            classify_tensor("token_emb.weight"),
             LayerCategory::Embedding
         );
         assert_eq!(

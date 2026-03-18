@@ -16,6 +16,7 @@ use ratatui::{Frame, Terminal};
 
 use crate::report::formatter::RenderOptions;
 use crate::types::{CompareReport, ModelReport, ModelSourceKind};
+use serde_json::Value;
 
 const BAR_WIDTH: usize = 24;
 const MAX_TENSORS: usize = 20;
@@ -349,7 +350,10 @@ fn build_model_sections(report: &ModelReport, options: &RenderOptions) -> Vec<Tu
             kv_line("Model", &report.model),
             kv_line("Source kind", &source_kind_label(&report.source.kind)),
             kv_line("Source", &report.source.location),
-            kv_line("Total params", &human_params(report.params.total_params)),
+            kv_line(
+                "Total params (excl head)",
+                &human_params(report.params.total_params),
+            ),
             kv_line("Tensor files", &report.tensor_files_found.to_string()),
             kv_line(
                 "Model size",
@@ -485,14 +489,8 @@ fn build_model_sections(report: &ModelReport, options: &RenderOptions) -> Vec<Tu
             ];
 
             if let Some(config) = &report.config {
-                if let Some(obj) = config.as_object() {
-                    let mut keys = obj.keys().collect::<Vec<_>>();
-                    keys.sort();
-                    for key in keys {
-                        if let Some(value) = obj.get(key) {
-                            lines.push(kv_line(&format!("cfg.{key}"), &format_config_value(value)));
-                        }
-                    }
+                for (key, value) in flatten_config_fields("cfg", config) {
+                    lines.push(kv_line(&key, &value));
                 }
             }
 
@@ -879,9 +877,36 @@ fn truncate(s: &str, max_len: usize) -> String {
     out
 }
 
-fn format_config_value(value: &serde_json::Value) -> String {
+fn flatten_config_fields(prefix: &str, value: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    flatten_config_fields_inner(prefix, value, &mut out);
+    out
+}
+
+fn flatten_config_fields_inner(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
     match value {
-        serde_json::Value::String(s) => s.clone(),
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                if let Some(v) = map.get(key) {
+                    flatten_config_fields_inner(&format!("{prefix}.{key}"), v, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for (idx, v) in arr.iter().enumerate() {
+                flatten_config_fields_inner(&format!("{prefix}[{idx}]"), v, out);
+            }
+        }
+        _ => out.push((prefix.to_string(), format_config_leaf(value))),
+    }
+}
+
+fn format_config_leaf(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
         _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
     }
 }

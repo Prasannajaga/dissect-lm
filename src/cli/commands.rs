@@ -265,7 +265,7 @@ pub async fn compare_models(
             ),
         ),
         diff_metric(
-            "Params",
+            "Params (excl head)",
             left.params.total_params.to_string(),
             right.params.total_params.to_string(),
         ),

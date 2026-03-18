@@ -48,15 +48,17 @@ pub struct CategoryTotals {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParamStats {
     pub total_params: u64,
+    #[serde(default)]
+    pub total_params_all: u64,
     pub categories: CategoryTotals,
 }
 
 impl ParamStats {
     pub fn pct(&self, value: u64) -> f64 {
-        if self.total_params == 0 {
+        if self.total_params_all == 0 {
             return 0.0;
         }
-        (value as f64 * 100.0) / self.total_params as f64
+        (value as f64 * 100.0) / self.total_params_all as f64
     }
 }
 
