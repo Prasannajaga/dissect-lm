@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use crate::hf::repo::{HfRepoClient, HfResolvedData};
 use crate::python_bridge::runner::run_deep_inspection;
 use crate::report::formatter::{RenderOptions, render_compare, render_model};
 use crate::report::json::{render_compare_json, render_model_json};
+use crate::report::tui::{run_compare_tui, run_model_tui};
 use crate::types::{
     ArchitectureInfo, CompareMetricDiff, CompareReport, ModelReport, ModelSource, ModelSourceKind,
 };
@@ -40,6 +42,8 @@ struct ResolvedInput {
     source: ModelSource,
     config: Option<Value>,
     tensors: Vec<TensorMetaRaw>,
+    tensor_files_found: usize,
+    model_size_bytes: Option<u64>,
     warnings: Vec<String>,
 }
 
@@ -57,6 +61,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             let report = compare_models(&model1, &model2, &options).await?;
             if options.json {
                 println!("{}", render_compare_json(&report)?);
+            } else if cli.tui {
+                if std::io::stdout().is_terminal() {
+                    run_compare_tui(&report)?;
+                } else {
+                    eprintln!(
+                        "--tui requested but stdout is not a terminal; falling back to text."
+                    );
+                    println!("{}", render_compare(&report));
+                }
             } else {
                 println!("{}", render_compare(&report));
             }
@@ -85,7 +98,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                     show_graph: options.show_graph,
                     show_attention_breakdown: options.show_attention_breakdown,
                 };
-                println!("{}", render_model(&report, &render_options));
+                if cli.tui {
+                    if std::io::stdout().is_terminal() {
+                        run_model_tui(&report, &render_options)?;
+                    } else {
+                        eprintln!(
+                            "--tui requested but stdout is not a terminal; falling back to text."
+                        );
+                        println!("{}", render_model(&report, &render_options));
+                    }
+                } else {
+                    println!("{}", render_model(&report, &render_options));
+                }
             }
         }
     }
@@ -94,15 +118,16 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<ModelReport> {
     let mut spinner = LoadingSpinner::start(format!("Inspecting {model}"));
-    spinner.set_message("Resolving model source...");
-    let mut resolved = resolve_input(model).await?;
+    spinner.stage("Resolving model source");
+    let mut resolved = resolve_input(model, &spinner).await?;
 
-    spinner.set_message("Analyzing metadata...");
+    spinner.stage("Analyzing metadata");
     let mut architecture = match &resolved.config {
         Some(cfg) => architecture_from_config(cfg),
         None => ArchitectureInfo::default(),
     };
 
+    spinner.stage("Analyzing tensor weights");
     let (tensor_metas, param_stats, mut attention_info) =
         summarize_tensors(&resolved.tensors, &architecture);
     if architecture.attention_type.is_none() {
@@ -110,14 +135,14 @@ pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<Mode
     }
 
     let graph = if options.show_graph {
-        spinner.set_message("Building architecture graph...");
+        spinner.stage("Building architecture graph");
         Some(build_architecture_graph(&architecture))
     } else {
         None
     };
 
     let deep = if options.deep {
-        spinner.set_message("Running deep inspection...");
+        spinner.stage("Running deep inspection");
         Some(
             run_deep_inspection(
                 model,
@@ -141,12 +166,28 @@ pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<Mode
         attention_info.attention_type = architecture.attention_type.clone();
     }
 
+    let mut dtype_set = BTreeSet::new();
+    for tensor in &tensor_metas {
+        dtype_set.insert(tensor.dtype.clone());
+    }
+    let tensor_dtypes = dtype_set.into_iter().collect::<Vec<_>>();
+    let config_key_count = resolved
+        .config
+        .as_ref()
+        .and_then(Value::as_object)
+        .map_or(0, |obj| obj.len());
+
     let report = ModelReport {
         model: model.to_string(),
         source: resolved.source,
+        config: resolved.config,
+        config_key_count,
         architecture,
         params: param_stats,
         attention: attention_info,
+        tensor_files_found: resolved.tensor_files_found,
+        model_size_bytes: resolved.model_size_bytes,
+        tensor_dtypes,
         tensor_count: tensor_metas.len(),
         tensors: if options.show_params {
             Some(tensor_metas)
@@ -287,8 +328,13 @@ struct LoadingSpinner {
 
 impl LoadingSpinner {
     fn start(message: String) -> Self {
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(Duration::from_millis(100));
+        let pb = if std::io::stderr().is_terminal() {
+            let spinner = ProgressBar::new_spinner();
+            spinner.enable_steady_tick(Duration::from_millis(100));
+            spinner
+        } else {
+            ProgressBar::hidden()
+        };
         pb.set_message(message);
         Self {
             pb,
@@ -300,13 +346,27 @@ impl LoadingSpinner {
         self.pb.set_message(message.to_string());
     }
 
+    fn stage(&self, message: &str) {
+        let msg = format!("{}...", message.trim_end_matches('.'));
+        if self.pb.is_hidden() {
+            eprintln!("{msg}");
+            return;
+        }
+
+        self.set_message(&msg);
+    }
+
     fn progress_bar(&self) -> ProgressBar {
         self.pb.clone()
     }
 
-    fn finish(&mut self, message: &str) {
+    fn finish(&mut self, _message: &str) {
         self.finished = true;
-        self.pb.finish_with_message(message.to_string());
+        if self.pb.is_hidden() {
+            return;
+        }
+
+        self.pb.finish_and_clear();
     }
 }
 
@@ -318,27 +378,36 @@ impl Drop for LoadingSpinner {
     }
 }
 
-async fn resolve_input(model: &str) -> Result<ResolvedInput> {
+async fn resolve_input(model: &str, spinner: &LoadingSpinner) -> Result<ResolvedInput> {
     let path = Path::new(model);
     if path.exists() {
-        resolve_local_input(path)
+        spinner.stage("Using local model path");
+        resolve_local_input(path, spinner)
     } else {
-        resolve_hf_input(model).await
+        spinner.stage("Pulling model metadata from Hugging Face");
+        resolve_hf_input(model, spinner).await
     }
 }
 
-fn resolve_local_input(path: &Path) -> Result<ResolvedInput> {
+fn resolve_local_input(path: &Path, spinner: &LoadingSpinner) -> Result<ResolvedInput> {
     let mut tensors = Vec::new();
     let mut warnings = Vec::new();
     let mut config = None;
+    let mut tensor_files_found = 0usize;
+    let mut model_size_bytes = None;
 
     if path.is_file() {
+        spinner.stage("Reading local file metadata");
         if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
             if ext.eq_ignore_ascii_case("safetensors") {
+                tensor_files_found = 1;
+                model_size_bytes = Some(std::fs::metadata(path)?.len());
+                spinner.stage("Reading safetensors header");
                 tensors.extend(read_header_from_file(path)?);
                 if let Some(parent) = path.parent() {
                     let cfg_path = parent.join("config.json");
                     if cfg_path.exists() {
+                        spinner.stage("Loading config.json");
                         config = Some(load_config_file(&cfg_path)?);
                     }
                 }
@@ -348,6 +417,7 @@ fn resolve_local_input(path: &Path) -> Result<ResolvedInput> {
                     .and_then(|s| s.to_str())
                     .is_some_and(|n| n == "config.json")
             {
+                spinner.stage("Loading config.json");
                 config = Some(load_config_file(path)?);
             } else {
                 warnings.push(
@@ -357,23 +427,45 @@ fn resolve_local_input(path: &Path) -> Result<ResolvedInput> {
             }
         }
     } else if path.is_dir() {
+        spinner.stage("Scanning local directory");
         let cfg_path = path.join("config.json");
         if cfg_path.exists() {
+            spinner.stage("Loading config.json");
             config = Some(load_config_file(&cfg_path)?);
         }
 
-        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let file_path = entry.path();
-            if file_path
-                .extension()
-                .and_then(|s| s.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
-            {
-                tensors.extend(read_header_from_file(file_path)?);
-            }
+        spinner.stage("Collecting safetensors files");
+        let safetensor_paths = WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter_map(|entry| {
+                let file_path = entry.path().to_path_buf();
+                file_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+                    .then_some(file_path)
+            })
+            .collect::<Vec<_>>();
+
+        let total = safetensor_paths.len();
+        tensor_files_found = total;
+        model_size_bytes = Some(0);
+        for (idx, file_path) in safetensor_paths.into_iter().enumerate() {
+            spinner.stage(&format!(
+                "Reading safetensors header ({}/{})",
+                idx + 1,
+                total
+            ));
+            let file_size = std::fs::metadata(&file_path)?.len();
+            model_size_bytes = model_size_bytes.map(|v| v.saturating_add(file_size));
+            tensors.extend(read_header_from_file(&file_path)?);
+        }
+
+        if total == 0 {
+            spinner.stage("No safetensors files found in local directory");
+            model_size_bytes = None;
         }
 
         if tensors.is_empty() {
@@ -394,6 +486,8 @@ fn resolve_local_input(path: &Path) -> Result<ResolvedInput> {
         },
         config,
         tensors,
+        tensor_files_found,
+        model_size_bytes,
         warnings,
     })
 }
@@ -419,13 +513,17 @@ fn find_unsupported_checkpoint_files(path: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-async fn resolve_hf_input(repo_id: &str) -> Result<ResolvedInput> {
+async fn resolve_hf_input(repo_id: &str, spinner: &LoadingSpinner) -> Result<ResolvedInput> {
     let client = HfRepoClient::new();
     let HfResolvedData {
         config,
         headers,
+        tensor_files_found,
+        model_size_bytes,
         warnings,
-    } = client.resolve(repo_id).await?;
+    } = client
+        .resolve_with_progress(repo_id, |stage| spinner.stage(stage))
+        .await?;
 
     let mut tensors = Vec::new();
     for header_json in headers {
@@ -448,6 +546,8 @@ async fn resolve_hf_input(repo_id: &str) -> Result<ResolvedInput> {
         },
         config,
         tensors,
+        tensor_files_found,
+        model_size_bytes,
         warnings,
     })
 }

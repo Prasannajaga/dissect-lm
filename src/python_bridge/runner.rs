@@ -39,8 +39,20 @@ pub async fn run_deep_inspection(
     };
 
     let started = Instant::now();
-    if let Some(pb) = &progress {
-        pb.set_message("Running deep inspection... 0s elapsed".to_string());
+    announce(
+        &progress,
+        "Running deep inspection: starting Python bridge...",
+    );
+    if checkpoint.is_some() {
+        announce(
+            &progress,
+            "Running deep inspection: loading checkpoint in Python...",
+        );
+    } else {
+        announce(
+            &progress,
+            "Running deep inspection: loading model in Python...",
+        );
     }
 
     loop {
@@ -50,10 +62,11 @@ pub async fn run_deep_inspection(
         {
             Some(_) => break,
             None => {
-                if let Some(pb) = &progress {
-                    let elapsed = started.elapsed().as_secs();
-                    pb.set_message(format!("Running deep inspection... {elapsed}s elapsed"));
-                }
+                let elapsed = started.elapsed().as_secs();
+                set_status(
+                    &progress,
+                    &format!("Running deep inspection: analyzing weights... {elapsed}s elapsed"),
+                );
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -72,11 +85,30 @@ pub async fn run_deep_inspection(
         );
     }
 
+    announce(&progress, "Running deep inspection: parsing results...");
+
     let stdout = String::from_utf8(output.stdout).context("deep inspector output is not utf8")?;
     let json: Value =
         serde_json::from_str(&stdout).context("deep inspector did not return valid json")?;
 
     Ok(json)
+}
+
+fn announce(progress: &Option<ProgressBar>, message: &str) {
+    if let Some(pb) = progress {
+        if pb.is_hidden() {
+            eprintln!("{message}");
+        } else {
+            pb.println(format!("• {message}"));
+            pb.set_message(message.to_string());
+        }
+    }
+}
+
+fn set_status(progress: &Option<ProgressBar>, message: &str) {
+    if let Some(pb) = progress {
+        pb.set_message(message.to_string());
+    }
 }
 
 #[cfg(test)]

@@ -83,6 +83,22 @@ dissectlm gpt2 --params --json
 dissectlm compare gpt2 gpt2-medium --json
 ```
 
+### `--tui`
+Open an interactive full-screen TUI (tabs + scrollable sections).
+
+Controls:
+- `q` / `Esc`: quit
+- `←` / `→` (or `h` / `l`): switch sections
+- `j` / `k` (or `↑` / `↓`): scroll
+- `PgUp` / `PgDn`: fast scroll
+
+Examples:
+
+```bash
+dissectlm gpt2 --tui
+dissectlm compare gpt2 gpt2-medium --tui
+```
+
 ### `--deep` (optional Python path)
 Run optional deep inspection through Python bridge (`uv` project under `python/`).
 
@@ -113,6 +129,9 @@ dissectlm gpt2 --params --attention-breakdown
 
 # deep mode + JSON output
 dissectlm gpt2 --deep --json
+
+# interactive TUI
+dissectlm gpt2 --tui
 ```
 
 ## Notes

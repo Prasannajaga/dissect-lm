@@ -11,6 +11,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    #[arg(long, global = true, conflicts_with = "json")]
+    pub tui: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 
