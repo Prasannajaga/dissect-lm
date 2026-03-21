@@ -118,6 +118,45 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 pub async fn inspect_model(model: &str, options: &InspectOptions) -> Result<ModelReport> {
     let mut spinner = LoadingSpinner::start(format!("Inspecting {model}"));
+
+    if let Some(checkpoint) = options.checkpoint.as_deref() {
+        if !options.deep {
+            bail!("--checkpoint requires --deep");
+        }
+
+        spinner.stage("Running deep inspection");
+        let deep = Some(
+            run_deep_inspection(model, Some(checkpoint), Some(spinner.progress_bar())).await?,
+        );
+
+        let report = ModelReport {
+            model: checkpoint.to_string(),
+            source: ModelSource {
+                kind: ModelSourceKind::LocalPath,
+                location: checkpoint.to_string(),
+            },
+            config: None,
+            config_key_count: 0,
+            architecture: ArchitectureInfo::default(),
+            params: Default::default(),
+            attention: Default::default(),
+            tensor_files_found: 0,
+            model_size_bytes: None,
+            tensor_dtypes: Vec::new(),
+            tensor_count: 0,
+            tensors: None,
+            graph: None,
+            deep,
+            warnings: vec![
+                "Checkpoint mode runs deep inspection only; metadata-first analysis is skipped."
+                    .to_string(),
+            ],
+        };
+
+        spinner.finish("Inspection complete");
+        return Ok(report);
+    }
+
     spinner.stage("Resolving model source");
     let mut resolved = resolve_input(model, &spinner).await?;
 

@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
 
-    #[arg(long, value_name = "PATH", requires = "deep")]
+    #[arg(long, value_name = "PATH", requires = "deep", conflicts_with = "model")]
     pub checkpoint: Option<String>,
 
     #[arg(long, requires = "model", conflicts_with = "checkpoint")]
@@ -48,4 +48,30 @@ pub enum Commands {
         #[arg(long)]
         deep: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn checkpoint_without_model_is_allowed_in_deep_mode() {
+        let cli = Cli::parse_from(["dissectlm", "--deep", "--checkpoint", "/tmp/model.ckpt"]);
+        assert!(cli.model.is_none());
+        assert_eq!(cli.checkpoint.as_deref(), Some("/tmp/model.ckpt"));
+        assert!(cli.deep);
+    }
+
+    #[test]
+    fn checkpoint_conflicts_with_model() {
+        let parsed = Cli::try_parse_from([
+            "dissectlm",
+            "gpt2",
+            "--deep",
+            "--checkpoint",
+            "/tmp/model.ckpt",
+        ]);
+        assert!(parsed.is_err());
+    }
 }

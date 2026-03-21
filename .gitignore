@@ -1,4 +1,3 @@
 /target
-tests/integration_local.rs
-architecture.md
+tests/integration_local.rs 
 openVino.md
