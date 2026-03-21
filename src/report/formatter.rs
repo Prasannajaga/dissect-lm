@@ -178,11 +178,8 @@ pub fn render_model(report: &ModelReport, options: &RenderOptions) -> String {
         let graph = report
             .graph
             .as_deref()
-            .unwrap_or("Graph unavailable")
-            .lines()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        out.push_str(&text_panel("Architecture Graph", &graph, &layout));
+            .unwrap_or("Graph unavailable");
+        out.push_str(&graph_panel("Architecture Graph", graph, &layout));
     }
 
     if options.show_params {
@@ -242,55 +239,374 @@ pub fn render_compare(report: &CompareReport) -> String {
 
     out.push_str(&render_header("DISSECTLM MODEL COMPARISON", &layout));
 
-    let changed_count = report
-        .diffs
-        .iter()
-        .filter(|d| d.left != d.right)
-        .count();
-    let total_count = report.diffs.len();
-    let header_rows = vec![
-        ("Left".to_string(), report.left.model.clone()),
-        ("Right".to_string(), report.right.model.clone()),
+    // ── Side-by-side model summary ──
+    let left_summary = vec![
+        ("Source".into(), source_kind_label(&report.left.source.kind)),
+        ("Params".into(), human_params(report.left.params.total_params)),
         (
-            "Metrics changed".to_string(),
-            format!("{changed_count} / {total_count}"),
+            "Model size".into(),
+            report.left.model_size_bytes.map(human_bytes).unwrap_or_else(|| "-".into()),
         ),
+        ("Tensor files".into(), report.left.tensor_files_found.to_string()),
+        ("Tensors".into(), report.left.tensor_count.to_string()),
+        (
+            "Dtypes".into(),
+            if report.left.tensor_dtypes.is_empty() { "-".into() } else { report.left.tensor_dtypes.join(", ") },
+        ),
+        ("Config keys".into(), report.left.config_key_count.to_string()),
     ];
-    out.push_str(&kv_panel("Models", &header_rows, &layout));
-
-    let status_width = 3;
-    let available = layout.inner_width.saturating_sub(status_width + 3);
-    let metric_width = ((available as f64) * 0.34).round() as usize;
-    let metric_width = metric_width.clamp(12, 26).min(available.saturating_sub(16));
-    let left_width = (available.saturating_sub(metric_width)) / 2;
-    let right_width = available.saturating_sub(metric_width + left_width);
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{:<status_width$} {:<metric_width$} {:<left_width$} {:<right_width$}",
-        " ", "Metric", "Left", "Right"
+    let right_summary = vec![
+        ("Source".into(), source_kind_label(&report.right.source.kind)),
+        ("Params".into(), human_params(report.right.params.total_params)),
+        (
+            "Model size".into(),
+            report.right.model_size_bytes.map(human_bytes).unwrap_or_else(|| "-".into()),
+        ),
+        ("Tensor files".into(), report.right.tensor_files_found.to_string()),
+        ("Tensors".into(), report.right.tensor_count.to_string()),
+        (
+            "Dtypes".into(),
+            if report.right.tensor_dtypes.is_empty() { "-".into() } else { report.right.tensor_dtypes.join(", ") },
+        ),
+        ("Config keys".into(), report.right.config_key_count.to_string()),
+    ];
+    out.push_str(&dual_kv_panel(
+        &report.left.model, &report.right.model,
+        &left_summary, &right_summary, &layout,
     ));
-    lines.push("─".repeat(layout.inner_width));
 
-    for diff in &report.diffs {
-        let marker = if diff.left != diff.right {
-            "≠"
-        } else {
-            "="
-        };
-        lines.push(format!(
-            "{:<status_width$} {:<metric_width$} {:<left_width$} {:<right_width$}",
-            marker,
-            truncate(&diff.metric, metric_width),
-            truncate(&diff.left, left_width),
-            truncate(&diff.right, right_width)
+    // ── Side-by-side architecture ──
+    let left_arch = vec![
+        ("Model type".into(), report.left.architecture.model_type.clone().unwrap_or_else(|| "-".into())),
+        ("Layers".into(), opt_u64(report.left.architecture.num_layers)),
+        ("Hidden size".into(), opt_u64(report.left.architecture.hidden_size)),
+        ("Heads".into(), opt_u64(report.left.architecture.num_heads)),
+        ("KV heads".into(), opt_u64(report.left.architecture.num_key_value_heads.or(report.left.attention.kv_heads))),
+        ("Attention".into(), report.left.architecture.attention_type.clone().or(report.left.attention.attention_type.clone()).unwrap_or_else(|| "-".into())),
+    ];
+    let right_arch = vec![
+        ("Model type".into(), report.right.architecture.model_type.clone().unwrap_or_else(|| "-".into())),
+        ("Layers".into(), opt_u64(report.right.architecture.num_layers)),
+        ("Hidden size".into(), opt_u64(report.right.architecture.hidden_size)),
+        ("Heads".into(), opt_u64(report.right.architecture.num_heads)),
+        ("KV heads".into(), opt_u64(report.right.architecture.num_key_value_heads.or(report.right.attention.kv_heads))),
+        ("Attention".into(), report.right.architecture.attention_type.clone().or(report.right.attention.attention_type.clone()).unwrap_or_else(|| "-".into())),
+    ];
+    out.push_str(&dual_kv_panel(
+        "Architecture", "Architecture",
+        &left_arch, &right_arch, &layout,
+    ));
+
+    // ── Side-by-side distribution ──
+    let left_dist: Vec<(&str, u64, f64)> = vec![
+        ("FeedForward", report.left.params.categories.feedforward, report.left.params.pct(report.left.params.categories.feedforward)),
+        ("Attention", report.left.params.categories.attention, report.left.params.pct(report.left.params.categories.attention)),
+        ("Embedding", report.left.params.categories.embedding, report.left.params.pct(report.left.params.categories.embedding)),
+        ("Normalization", report.left.params.categories.normalization, report.left.params.pct(report.left.params.categories.normalization)),
+        ("OutputHead", report.left.params.categories.output_head, report.left.params.pct(report.left.params.categories.output_head)),
+        ("Other", report.left.params.categories.other, report.left.params.pct(report.left.params.categories.other)),
+    ];
+    let right_dist: Vec<(&str, u64, f64)> = vec![
+        ("FeedForward", report.right.params.categories.feedforward, report.right.params.pct(report.right.params.categories.feedforward)),
+        ("Attention", report.right.params.categories.attention, report.right.params.pct(report.right.params.categories.attention)),
+        ("Embedding", report.right.params.categories.embedding, report.right.params.pct(report.right.params.categories.embedding)),
+        ("Normalization", report.right.params.categories.normalization, report.right.params.pct(report.right.params.categories.normalization)),
+        ("OutputHead", report.right.params.categories.output_head, report.right.params.pct(report.right.params.categories.output_head)),
+        ("Other", report.right.params.categories.other, report.right.params.pct(report.right.params.categories.other)),
+    ];
+    out.push_str(&dual_distribution_panel(
+        "Distribution", "Distribution",
+        &left_dist, &right_dist, &layout,
+    ));
+
+    // ── Changes summary panel ──
+    out.push_str(&changes_panel(report, &layout));
+
+    out.push_str(&render_footer(&layout));
+    out
+}
+
+/// Two KV panels side-by-side: ╭─ title A ─┬─ title B ─╮ ... ╰───┴───╯
+fn dual_kv_panel(
+    left_title: &str, right_title: &str,
+    left_rows: &[(String, String)],
+    right_rows: &[(String, String)],
+    layout: &RenderLayout,
+) -> String {
+    let pw = layout.panel_width;
+    let left_sec = (pw.saturating_sub(3)) / 2;
+    let right_sec = pw.saturating_sub(3).saturating_sub(left_sec);
+    let li = left_sec.saturating_sub(2);   // inner text width
+    let ri = right_sec.saturating_sub(2);
+    let key_w = (li as f64 * 0.38).round().clamp(8.0, 18.0) as usize;
+    let max_rows = left_rows.len().max(right_rows.len());
+
+    let mut out = String::new();
+
+    // Top: ╭─ title ─┬─ title ─╮
+    let lt = format!(" {} ", truncate(left_title, left_sec.saturating_sub(4)));
+    let rt = format!(" {} ", truncate(right_title, right_sec.saturating_sub(4)));
+    let lt_c = lt.chars().count();
+    let rt_c = rt.chars().count();
+    let lt_l = 2.min(left_sec.saturating_sub(lt_c) / 2);
+    let lt_r = left_sec.saturating_sub(lt_c + lt_l);
+    let rt_l = 2.min(right_sec.saturating_sub(rt_c) / 2);
+    let rt_r = right_sec.saturating_sub(rt_c + rt_l);
+
+    out.push_str(&format!(
+        "  {}{}{}{}{}{}{}{}{}",
+        style("╭").dim(), style("─".repeat(lt_l)).dim(),
+        style(&lt).bold().cyan(), style("─".repeat(lt_r)).dim(),
+        style("┬").dim(), style("─".repeat(rt_l)).dim(),
+        style(&rt).bold().cyan(), style("─".repeat(rt_r)).dim(),
+        style("╮").dim(),
+    ));
+    out.push('\n');
+
+    // Content rows
+    for i in 0..max_rows {
+        let left_text = if i < left_rows.len() {
+            let k = truncate(&left_rows[i].0, key_w);
+            let v_w = li.saturating_sub(key_w + 1);
+            let v = truncate(&left_rows[i].1, v_w);
+            format!("{:<key_w$} {}", k, v)
+        } else { String::new() };
+
+        let right_text = if i < right_rows.len() {
+            let k = truncate(&right_rows[i].0, key_w);
+            let v_w = ri.saturating_sub(key_w + 1);
+            let v = truncate(&right_rows[i].1, v_w);
+            format!("{:<key_w$} {}", k, v)
+        } else { String::new() };
+
+        // Diff marker on the right edge
+        let changed = i < left_rows.len() && i < right_rows.len()
+            && left_rows[i].0 == right_rows[i].0
+            && left_rows[i].1 != right_rows[i].1;
+
+        let lpad = li.saturating_sub(left_text.chars().count());
+        // Reserve 2 chars on right side for marker
+        let marker_w = 2;
+        let rpad = ri.saturating_sub(right_text.chars().count() + marker_w);
+        let marker = if changed { " ≠" } else { "  " };
+
+        out.push_str(&format!(
+            "  {} {}{} {} {}{}{} {}",
+            style("│").dim(),
+            left_text, " ".repeat(lpad),
+            style("│").dim(),
+            right_text, " ".repeat(rpad), marker,
+            style("│").dim(),
         ));
+        out.push('\n');
     }
 
-    out.push_str(&text_panel("Comparison", &lines, &layout));
-    out.push_str(&render_footer(&layout));
-
+    // Bottom: ╰───┴───╯
+    out.push_str(&format!(
+        "  {}{}{}{}{}",
+        style("╰").dim(), style("─".repeat(left_sec)).dim(),
+        style("┴").dim(), style("─".repeat(right_sec)).dim(),
+        style("╯").dim(),
+    ));
+    out.push_str("\n\n");
     out
+}
+
+/// Two distribution panels side-by-side with bars in each column.
+fn dual_distribution_panel(
+    left_title: &str, right_title: &str,
+    left_rows: &[(&str, u64, f64)],
+    right_rows: &[(&str, u64, f64)],
+    layout: &RenderLayout,
+) -> String {
+    let pw = layout.panel_width;
+    let left_sec = (pw.saturating_sub(3)) / 2;
+    let right_sec = pw.saturating_sub(3).saturating_sub(left_sec);
+    let li = left_sec.saturating_sub(2);
+    let ri = right_sec.saturating_sub(2);
+    let max_rows = left_rows.len().max(right_rows.len());
+    let cat_w = 13usize.min(li.saturating_sub(20)).max(8);
+    let bar_w = li.saturating_sub(cat_w + 22).min(layout.bar_width).max(0);
+
+    let mut out = String::new();
+
+    // Top border
+    let lt = format!(" {} ", truncate(left_title, left_sec.saturating_sub(4)));
+    let rt = format!(" {} ", truncate(right_title, right_sec.saturating_sub(4)));
+    let lt_c = lt.chars().count();
+    let rt_c = rt.chars().count();
+    let lt_l = 2.min(left_sec.saturating_sub(lt_c) / 2);
+    let lt_r = left_sec.saturating_sub(lt_c + lt_l);
+    let rt_l = 2.min(right_sec.saturating_sub(rt_c) / 2);
+    let rt_r = right_sec.saturating_sub(rt_c + rt_l);
+
+    out.push_str(&format!(
+        "  {}{}{}{}{}{}{}{}{}",
+        style("╭").dim(), style("─".repeat(lt_l)).dim(),
+        style(&lt).bold().cyan(), style("─".repeat(lt_r)).dim(),
+        style("┬").dim(), style("─".repeat(rt_l)).dim(),
+        style(&rt).bold().cyan(), style("─".repeat(rt_r)).dim(),
+        style("╮").dim(),
+    ));
+    out.push('\n');
+
+    // Header row
+    let hdr = format!("{:<cat_w$} {:>7} {:>10}", "Category", "Share", "Params");
+    let lhpad = li.saturating_sub(hdr.chars().count());
+    let rhpad = ri.saturating_sub(hdr.chars().count());
+    out.push_str(&format!(
+        "  {} {}{} {} {}{} {}",
+        style("│").dim(), hdr, " ".repeat(lhpad),
+        style("│").dim(), hdr, " ".repeat(rhpad),
+        style("│").dim(),
+    ));
+    out.push('\n');
+
+    // Separator
+    let sep_l = "─".repeat(li);
+    let sep_r = "─".repeat(ri);
+    out.push_str(&format!(
+        "  {} {} {} {} {}",
+        style("│").dim(), sep_l,
+        style("│").dim(), sep_r,
+        style("│").dim(),
+    ));
+    out.push('\n');
+
+    // Rows
+    for i in 0..max_rows {
+        // Left column data line
+        let left_text = if i < left_rows.len() {
+            let (name, count, pct) = left_rows[i];
+            format!("{:<cat_w$} {:>6.1}% {:>10}", name, pct, human_params(count))
+        } else { String::new() };
+
+        let right_text = if i < right_rows.len() {
+            let (name, count, pct) = right_rows[i];
+            format!("{:<cat_w$} {:>6.1}% {:>10}", name, pct, human_params(count))
+        } else { String::new() };
+
+        let changed = i < left_rows.len() && i < right_rows.len()
+            && (left_rows[i].1 != right_rows[i].1 || (left_rows[i].2 - right_rows[i].2).abs() > 0.05);
+        let marker_w = 2;
+        let lpad = li.saturating_sub(left_text.chars().count());
+        let rpad = ri.saturating_sub(right_text.chars().count() + marker_w);
+        let marker = if changed { " ≠" } else { "  " };
+
+        out.push_str(&format!(
+            "  {} {}{} {} {}{}{} {}",
+            style("│").dim(), left_text, " ".repeat(lpad),
+            style("│").dim(), right_text, " ".repeat(rpad), marker,
+            style("│").dim(),
+        ));
+        out.push('\n');
+
+        // Bar row (if space)
+        if bar_w >= 4 {
+            let l_bar = if i < left_rows.len() { pct_bar(left_rows[i].2, bar_w) } else { " ".repeat(bar_w) };
+            let r_bar = if i < right_rows.len() { pct_bar(right_rows[i].2, bar_w) } else { " ".repeat(bar_w) };
+            let lb_pad = li.saturating_sub(l_bar.chars().count());
+            let rb_pad = ri.saturating_sub(r_bar.chars().count());
+            out.push_str(&format!(
+                "  {} {}{} {} {}{} {}",
+                style("│").dim(), l_bar, " ".repeat(lb_pad),
+                style("│").dim(), r_bar, " ".repeat(rb_pad),
+                style("│").dim(),
+            ));
+            out.push('\n');
+        }
+    }
+
+    // Total row
+    let l_total: u64 = left_rows.iter().map(|(_, c, _)| c).sum();
+    let r_total: u64 = right_rows.iter().map(|(_, c, _)| c).sum();
+    let sep_l2 = "─".repeat(li);
+    let sep_r2 = "─".repeat(ri);
+    out.push_str(&format!(
+        "  {} {} {} {} {}",
+        style("│").dim(), sep_l2,
+        style("│").dim(), sep_r2,
+        style("│").dim(),
+    ));
+    out.push('\n');
+    let lt_text = format!("{:<cat_w$} {:>7} {:>10}", "TOTAL", "", human_params(l_total));
+    let rt_text = format!("{:<cat_w$} {:>7} {:>10}", "TOTAL", "", human_params(r_total));
+    let lt_pad = li.saturating_sub(lt_text.chars().count());
+    let rt_pad = ri.saturating_sub(rt_text.chars().count());
+    out.push_str(&format!(
+        "  {} {}{} {} {}{} {}",
+        style("│").dim(), lt_text, " ".repeat(lt_pad),
+        style("│").dim(), rt_text, " ".repeat(rt_pad),
+        style("│").dim(),
+    ));
+    out.push('\n');
+
+    // Bottom border
+    out.push_str(&format!(
+        "  {}{}{}{}{}",
+        style("╰").dim(), style("─".repeat(left_sec)).dim(),
+        style("┴").dim(), style("─".repeat(right_sec)).dim(),
+        style("╯").dim(),
+    ));
+    out.push_str("\n\n");
+    out
+}
+
+/// Side-by-side panel summarizing delta / changes.
+fn changes_panel(report: &CompareReport, layout: &RenderLayout) -> String {
+    let changed_count = report.diffs.iter().filter(|d| d.left != d.right).count();
+    let total_count = report.diffs.len();
+    let (l_p, r_p) = (report.left.params.total_params, report.right.params.total_params);
+
+    let mut left_rows = Vec::new();
+    let mut right_rows = Vec::new();
+
+    let l_status = format!("{} metrics", total_count);
+    let r_status = if changed_count > 0 {
+        format!("{changed_count} changed  ⚠")
+    } else {
+        format!("All identical  ✓")
+    };
+    left_rows.push(("Status".into(), l_status));
+    right_rows.push(("Status".into(), r_status));
+
+    // Param delta
+    if l_p != r_p {
+        let (arrow, abs) = if r_p > l_p { ("▲", r_p - l_p) } else { ("▼", l_p - r_p) };
+        let pct = if l_p > 0 { (abs as f64 / l_p as f64) * 100.0 } else { 100.0 };
+        left_rows.push(("Param delta".into(), human_params(l_p)));
+        right_rows.push(("Param delta".into(), format!("{}  {} {} ({:.1}%)", human_params(r_p), arrow, human_params(abs), pct)));
+    } else {
+        left_rows.push(("Param delta".into(), human_params(l_p)));
+        right_rows.push(("Param delta".into(), format!("{} (identical)", human_params(r_p))));
+    }
+
+    // Size delta
+    if let (Some(ls), Some(rs)) = (report.left.model_size_bytes, report.right.model_size_bytes) {
+        if ls != rs {
+            let (arrow, abs) = if rs > ls { ("▲", rs - ls) } else { ("▼", ls - rs) };
+            left_rows.push(("Size delta".into(), human_bytes(ls)));
+            right_rows.push(("Size delta".into(), format!("{}  {} {}", human_bytes(rs), arrow, human_bytes(abs))));
+        } else {
+            left_rows.push(("Size delta".into(), human_bytes(ls)));
+            right_rows.push(("Size delta".into(), format!("{} (identical)", human_bytes(rs))));
+        }
+    }
+
+    // List changed metrics
+    let changed: Vec<_> = report.diffs.iter().filter(|d| d.left != d.right).collect();
+    if !changed.is_empty() {
+        left_rows.push((String::new(), String::new()));
+        right_rows.push((String::new(), String::new()));
+        left_rows.push(("Changed metrics".into(), String::new()));
+        right_rows.push(("Changed metrics".into(), String::new()));
+        for d in &changed {
+            left_rows.push((d.metric.clone(), d.left.clone()));
+            right_rows.push((d.metric.clone(), d.right.clone()));
+        }
+    }
+
+    dual_kv_panel("Changes", "Changes", &left_rows, &right_rows, layout)
 }
 
 fn render_header(title: &str, layout: &RenderLayout) -> String {
@@ -477,6 +793,227 @@ fn text_panel(title: &str, lines: &[String], layout: &RenderLayout) -> String {
     out.push_str("\n\n");
     out
 }
+
+/// Render the architecture graph inside a panel frame with per-line colorization.
+fn graph_panel(title: &str, graph: &str, layout: &RenderLayout) -> String {
+    let mut out = String::new();
+    let pw = layout.panel_width;
+    let iw = layout.inner_width;
+
+    // Top border
+    out.push_str(&format!(
+        "  {}{}{}",
+        style("╭").dim(),
+        style("─".repeat(pw - 2)).dim(),
+        style("╮").dim()
+    ));
+    out.push('\n');
+
+    // Title row
+    let title_display = format!(" {} ", title);
+    let title_pad = iw.saturating_sub(title_display.chars().count());
+    out.push_str(&format!(
+        "  {} {}{} {}",
+        style("│").dim(),
+        style(&title_display).bold().cyan(),
+        " ".repeat(title_pad),
+        style("│").dim()
+    ));
+    out.push('\n');
+
+    // Title separator
+    out.push_str(&format!(
+        "  {}{}{}",
+        style("├").dim(),
+        style("─".repeat(pw - 2)).dim(),
+        style("┤").dim()
+    ));
+    out.push('\n');
+
+    // Empty line before graph
+    let empty_pad = " ".repeat(iw);
+    out.push_str(&format!(
+        "  {} {} {}",
+        style("│").dim(),
+        empty_pad,
+        style("│").dim()
+    ));
+    out.push('\n');
+
+    // Graph content lines with colorization
+    for line in graph.lines() {
+        let styled_line = colorize_graph_line(line);
+        // We need char count of the raw line for padding
+        let char_count = line.chars().count();
+        // Center the graph lines with some left indent
+        let left_indent = 4usize.min(iw.saturating_sub(char_count) / 2);
+        let right_pad = iw.saturating_sub(left_indent + char_count);
+
+        out.push_str(&format!(
+            "  {} {}{}{} {}",
+            style("│").dim(),
+            " ".repeat(left_indent),
+            styled_line,
+            " ".repeat(right_pad),
+            style("│").dim()
+        ));
+        out.push('\n');
+    }
+
+    // Empty line after graph
+    out.push_str(&format!(
+        "  {} {} {}",
+        style("│").dim(),
+        empty_pad,
+        style("│").dim()
+    ));
+    out.push('\n');
+
+    // Bottom border
+    out.push_str(&format!(
+        "  {}{}{}",
+        style("╰").dim(),
+        style("─".repeat(pw - 2)).dim(),
+        style("╯").dim()
+    ));
+    out.push_str("\n\n");
+    out
+}
+
+/// Colorize a single graph line for CLI output using `console::style`.
+fn colorize_graph_line(line: &str) -> String {
+    let trimmed = line.trim();
+
+    // Pure arrow
+    if trimmed == "▼" {
+        return format!("{}", style(line).cyan().bold());
+    }
+
+    // Pure border line
+    if trimmed.chars().all(|c| matches!(c, '╭' | '╮' | '╯' | '╰' | '│' | '├' | '┤' | '─' | '┊' | ' ')) {
+        return format!("{}", style(line).blue().dim());
+    }
+
+    // Component bullet lines
+    if trimmed.contains('○') {
+        return colorize_component_line(line);
+    }
+
+    // Title/content lines inside boxes
+    if trimmed.contains('│') || trimmed.contains('┊') {
+        return colorize_box_content_line(line);
+    }
+
+    // Fallback
+    line.to_string()
+}
+
+/// Colorize a line that contains component bullets (○).
+fn colorize_component_line(line: &str) -> String {
+    let mut result = String::new();
+
+    if let Some(bullet_pos) = line.find('○') {
+        let before = &line[..bullet_pos];
+        let after = &line[bullet_pos + '○'.len_utf8()..];
+
+        // Leading border chars
+        result.push_str(&format!("{}", style(before).blue().dim()));
+        // Orange bullet
+        result.push_str(&format!("{}", style("○").yellow().bold()));
+
+        // After bullet: split at parens for detail
+        if let Some(paren_start) = after.find('(') {
+            let name_part = &after[..paren_start];
+            result.push_str(&format!("{}", style(name_part).white().bright()));
+
+            if let Some(paren_end) = after[paren_start..].find(')') {
+                let paren_content = &after[paren_start..paren_start + paren_end + 1];
+                let trailing = &after[paren_start + paren_end + 1..];
+                result.push_str(&format!("{}", style(paren_content).green()));
+                if !trailing.is_empty() {
+                    result.push_str(&format!("{}", style(trailing).blue().dim()));
+                }
+            } else {
+                result.push_str(&format!("{}", style(&after[paren_start..]).green()));
+            }
+        } else {
+            // No parens — split at trailing border chars
+            let (text_part, border_part) = split_at_trailing_borders_cli(after);
+            result.push_str(&format!("{}", style(text_part).white().bright()));
+            if !border_part.is_empty() {
+                result.push_str(&format!("{}", style(border_part).blue().dim()));
+            }
+        }
+    } else {
+        result.push_str(line);
+    }
+
+    result
+}
+
+/// Colorize a line that has box borders and text content (titles).
+fn colorize_box_content_line(line: &str) -> String {
+    let mut result = String::new();
+    let mut in_border = true;
+    let mut buffer = String::new();
+
+    for c in line.chars() {
+        let is_box = matches!(c, '╭' | '╮' | '╯' | '╰' | '│' | '├' | '┤' | '─' | '┊');
+        if is_box {
+            if !in_border && !buffer.is_empty() {
+                result.push_str(&format!("{}", style(&buffer).yellow().bold()));
+                buffer.clear();
+            }
+            in_border = true;
+            buffer.push(c);
+        } else {
+            if in_border && !buffer.is_empty() {
+                let s = if buffer.contains('┊') {
+                    format!("{}", style(&buffer).magenta().dim())
+                } else {
+                    format!("{}", style(&buffer).blue().dim())
+                };
+                result.push_str(&s);
+                buffer.clear();
+            }
+            in_border = false;
+            buffer.push(c);
+        }
+    }
+
+    // Flush
+    if !buffer.is_empty() {
+        if in_border {
+            let s = if buffer.contains('┊') {
+                format!("{}", style(&buffer).magenta().dim())
+            } else {
+                format!("{}", style(&buffer).blue().dim())
+            };
+            result.push_str(&s);
+        } else {
+            result.push_str(&format!("{}", style(&buffer).yellow().bold()));
+        }
+    }
+
+    result
+}
+
+/// Split a string into (text, trailing_borders) for CLI colorization.
+fn split_at_trailing_borders_cli(s: &str) -> (&str, &str) {
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+    let mut split_pos = s.len();
+
+    for &(idx, c) in char_indices.iter().rev() {
+        if matches!(c, '╭' | '╮' | '╯' | '╰' | '│' | '├' | '┤' | '─' | '┊') || c == ' ' {
+            split_pos = idx;
+        } else {
+            break;
+        }
+    }
+
+    (&s[..split_pos], &s[split_pos..])
+}
+
 
 fn pct_bar(pct: f64, width: usize) -> String {
     let clamped = pct.clamp(0.0, 100.0);

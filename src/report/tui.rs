@@ -147,8 +147,8 @@ pub fn run_model_tui(report: &ModelReport, options: &RenderOptions) -> Result<()
 }
 
 pub fn run_compare_tui(report: &CompareReport) -> Result<()> {
-    let sections = build_compare_sections(report);
-    run_tui_loop(SectionApp::new("Model Comparison".to_string(), sections))
+    let app = build_compare_app(report);
+    run_compare_loop(app)
 }
 
 fn run_tui_loop(mut app: SectionApp) -> Result<()> {
@@ -528,12 +528,7 @@ fn build_model_sections(report: &ModelReport, options: &RenderOptions) -> Vec<Tu
             .as_deref()
             .unwrap_or("Graph unavailable")
             .lines()
-            .map(|s| {
-                Line::from(Span::styled(
-                    s.to_string(),
-                    Style::default().fg(VALUE_COLOR),
-                ))
-            })
+            .map(|s| style_graph_line(s))
             .collect::<Vec<_>>();
         sections.push(TuiSection {
             title: "Graph".to_string(),
@@ -634,107 +629,684 @@ fn build_model_sections(report: &ModelReport, options: &RenderOptions) -> Vec<Tu
     sections
 }
 
-fn build_compare_sections(report: &CompareReport) -> Vec<TuiSection> {
+// ── Compare TUI: column-wise side-by-side layout ──
+
+enum CompareTab {
+    Dual { left: TuiSection, right: TuiSection },
+    Single(TuiSection),
+}
+
+impl CompareTab {
+    fn title(&self) -> &str {
+        match self {
+            CompareTab::Dual { left, .. } => &left.title,
+            CompareTab::Single(s) => &s.title,
+        }
+    }
+}
+
+struct CompareApp {
+    title: String,
+    tabs: Vec<CompareTab>,
+    active_tab: usize,
+    scroll: u16,
+}
+
+impl CompareApp {
+    fn next_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+            self.scroll = 0;
+        }
+    }
+    fn prev_tab(&mut self) {
+        if !self.tabs.is_empty() {
+            self.active_tab = if self.active_tab == 0 {
+                self.tabs.len().saturating_sub(1)
+            } else {
+                self.active_tab.saturating_sub(1)
+            };
+            self.scroll = 0;
+        }
+    }
+    fn scroll_down(&mut self, n: u16) { self.scroll = self.scroll.saturating_add(n); }
+    fn scroll_up(&mut self, n: u16) { self.scroll = self.scroll.saturating_sub(n); }
+}
+
+fn run_compare_loop(mut app: CompareApp) -> Result<()> {
+    let mut guard = TerminalGuard::enter()?;
+    loop {
+        guard.terminal.draw(|frame| draw_compare(frame, &app))?;
+        if !event::poll(POLL_INTERVAL)? { continue; }
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat { continue; }
+            let exit = match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => true,
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => { app.next_tab(); false }
+                KeyCode::Left | KeyCode::Char('h') => { app.prev_tab(); false }
+                KeyCode::Down | KeyCode::Char('j') => { app.scroll_down(1); false }
+                KeyCode::Up | KeyCode::Char('k') => { app.scroll_up(1); false }
+                KeyCode::PageDown | KeyCode::Char(' ') => { app.scroll_down(8); false }
+                KeyCode::PageUp => { app.scroll_up(8); false }
+                KeyCode::Home => { app.scroll = 0; false }
+                KeyCode::End => { app.scroll_down(1000); false }
+                _ => false,
+            };
+            if exit { break; }
+        }
+    }
+    Ok(())
+}
+
+fn draw_compare(frame: &mut Frame<'_>, app: &CompareApp) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+
+    // Title
+    let title = Paragraph::new(app.title.clone())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER_COLOR))
+                .title(Span::styled(" DissectLM ", Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)))
+                .style(Style::default().bg(PANEL_BG)),
+        )
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(HEADER_COLOR).add_modifier(Modifier::BOLD));
+    frame.render_widget(title, areas[0]);
+
+    // Tabs
+    let tab_labels: Vec<Line<'_>> = app.tabs.iter().enumerate().map(|(i, t)| {
+        let s = if i == app.active_tab {
+            Style::default().fg(TAB_ACTIVE_COLOR).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TAB_INACTIVE_COLOR)
+        };
+        Line::from(Span::styled(t.title().to_string(), s))
+    }).collect();
+    let tabs = Tabs::new(tab_labels)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BORDER_COLOR))
+                .title(Span::styled(" Sections ", Style::default().fg(MUTED_COLOR)))
+                .style(Style::default().bg(PANEL_BG)),
+        )
+        .divider(Span::styled(" │ ", Style::default().fg(BORDER_COLOR)))
+        .select(app.active_tab)
+        .highlight_style(Style::default().fg(TAB_ACTIVE_COLOR).add_modifier(Modifier::BOLD));
+    frame.render_widget(tabs, areas[1]);
+
+    // Content — dual or single
+    match &app.tabs[app.active_tab] {
+        CompareTab::Dual { left, right } => {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(areas[2]);
+
+            let lp = Paragraph::new(Text::from(left.lines.clone()))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(BORDER_COLOR))
+                        .title(Span::styled(format!(" {} ", left.title), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)))
+                        .style(Style::default().bg(PANEL_BG)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll, 0));
+            frame.render_widget(lp, cols[0]);
+
+            let rp = Paragraph::new(Text::from(right.lines.clone()))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(BORDER_COLOR))
+                        .title(Span::styled(format!(" {} ", right.title), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)))
+                        .style(Style::default().bg(PANEL_BG)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll, 0));
+            frame.render_widget(rp, cols[1]);
+        }
+        CompareTab::Single(section) => {
+            let p = Paragraph::new(Text::from(section.lines.clone()))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(BORDER_COLOR))
+                        .title(Span::styled(format!(" {} ", section.title), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)))
+                        .style(Style::default().bg(PANEL_BG)),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((app.scroll, 0));
+            frame.render_widget(p, areas[2]);
+        }
+    }
+
+    draw_footer(frame, areas[3]);
+}
+
+fn build_compare_app(report: &CompareReport) -> CompareApp {
+    let tabs = build_compare_tabs(report);
+    CompareApp {
+        title: "Model Comparison".to_string(),
+        tabs,
+        active_tab: 0,
+        scroll: 0,
+    }
+}
+
+fn build_compare_tabs(report: &CompareReport) -> Vec<CompareTab> {
+    let mut tabs = Vec::new();
     let changed_count = report.diffs.iter().filter(|d| d.left != d.right).count();
     let total_count = report.diffs.len();
 
-    let overview = TuiSection {
-        title: "Overview".to_string(),
-        lines: vec![
-            kv_line("Left", &report.left.model),
-            kv_line("Right", &report.right.model),
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<20}", "Metrics changed"),
-                    Style::default().fg(MUTED_COLOR).bold(),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{changed_count}"),
-                    if changed_count > 0 {
-                        Style::default().fg(CHANGED_COLOR).bold()
-                    } else {
-                        Style::default().fg(SAME_COLOR)
-                    },
-                ),
-                Span::styled(
-                    format!(" / {total_count}"),
-                    Style::default().fg(MUTED_COLOR),
-                ),
-            ]),
-        ],
-    };
-
-    let mut metric_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{:<3}", " "),
-                Style::default().fg(MUTED_COLOR).bold(),
-            ),
-            Span::styled(
-                format!("{:<22}", "Metric"),
-                Style::default().fg(MUTED_COLOR).bold(),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:<26}", "Left"),
-                Style::default().fg(MUTED_COLOR).bold(),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:<26}", "Right"),
-                Style::default().fg(MUTED_COLOR).bold(),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "─".repeat(80),
-            Style::default().fg(BORDER_COLOR),
-        )),
+    // ── Summary (dual) ──
+    let left_summary = vec![
+        kv_line("Source", &source_kind_label(&report.left.source.kind)),
+        kv_line("Params", &human_params(report.left.params.total_params)),
+        kv_line("Model size", &report.left.model_size_bytes.map(human_bytes).unwrap_or_else(|| "-".into())),
+        kv_line("Tensor files", &report.left.tensor_files_found.to_string()),
+        kv_line("Tensors", &report.left.tensor_count.to_string()),
+        kv_line("Dtypes", &if report.left.tensor_dtypes.is_empty() { "-".into() } else { report.left.tensor_dtypes.join(", ") }),
+        kv_line("Config keys", &report.left.config_key_count.to_string()),
     ];
+    let right_summary = vec![
+        kv_line("Source", &source_kind_label(&report.right.source.kind)),
+        kv_line("Params", &human_params(report.right.params.total_params)),
+        kv_line("Model size", &report.right.model_size_bytes.map(human_bytes).unwrap_or_else(|| "-".into())),
+        kv_line("Tensor files", &report.right.tensor_files_found.to_string()),
+        kv_line("Tensors", &report.right.tensor_count.to_string()),
+        kv_line("Dtypes", &if report.right.tensor_dtypes.is_empty() { "-".into() } else { report.right.tensor_dtypes.join(", ") }),
+        kv_line("Config keys", &report.right.config_key_count.to_string()),
+    ];
+    tabs.push(CompareTab::Dual {
+        left: TuiSection { title: report.left.model.clone(), lines: left_summary },
+        right: TuiSection { title: report.right.model.clone(), lines: right_summary },
+    });
 
-    for diff in &report.diffs {
-        let changed = diff.left != diff.right;
-        let (marker, marker_style) = if changed {
-            ("≠", Style::default().fg(CHANGED_COLOR).bold())
-        } else {
-            ("=", Style::default().fg(SAME_COLOR))
-        };
+    // ── Architecture (dual) ──
+    let make_arch_lines = |r: &ModelReport| -> Vec<Line<'static>> {
+        vec![
+            kv_line("Model type", r.architecture.model_type.as_deref().unwrap_or("-")),
+            kv_line("Layers", &opt_u64(r.architecture.num_layers)),
+            kv_line("Hidden size", &opt_u64(r.architecture.hidden_size)),
+            kv_line("Heads", &opt_u64(r.architecture.num_heads)),
+            kv_line("KV heads", &opt_u64(r.architecture.num_key_value_heads.or(r.attention.kv_heads))),
+            kv_line("Attention", r.architecture.attention_type.as_deref().or(r.attention.attention_type.as_deref()).unwrap_or("-")),
+        ]
+    };
+    tabs.push(CompareTab::Dual {
+        left: TuiSection { title: report.left.model.clone(), lines: make_arch_lines(&report.left) },
+        right: TuiSection { title: report.right.model.clone(), lines: make_arch_lines(&report.right) },
+    });
 
-        let metric_style = if changed {
-            Style::default().fg(Color::Rgb(255, 220, 100)).bold()
-        } else {
-            Style::default().fg(VALUE_COLOR)
-        };
-
-        let left_style = if changed {
-            Style::default().fg(CHANGED_COLOR)
-        } else {
-            Style::default().fg(SAME_COLOR)
-        };
-
-        let right_style = if changed {
-            Style::default().fg(Color::Rgb(120, 220, 130))
-        } else {
-            Style::default().fg(SAME_COLOR)
-        };
-
-        metric_lines.push(Line::from(vec![
-            Span::styled(format!(" {} ", marker), marker_style),
-            Span::styled(format!("{:<22}", truncate(&diff.metric, 22)), metric_style),
+    // ── Distribution (dual with bars) ──
+    let make_dist_lines = |r: &ModelReport| -> Vec<Line<'static>> {
+        let categories: Vec<(&str, u64, f64)> = vec![
+            ("FeedForward", r.params.categories.feedforward, r.params.pct(r.params.categories.feedforward)),
+            ("Attention", r.params.categories.attention, r.params.pct(r.params.categories.attention)),
+            ("Embedding", r.params.categories.embedding, r.params.pct(r.params.categories.embedding)),
+            ("Normalization", r.params.categories.normalization, r.params.pct(r.params.categories.normalization)),
+            ("OutputHead", r.params.categories.output_head, r.params.pct(r.params.categories.output_head)),
+            ("Other", r.params.categories.other, r.params.pct(r.params.categories.other)),
+        ];
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(format!("{:<14}", "Category"), Style::default().fg(MUTED_COLOR).bold()),
+                Span::raw(" "),
+                Span::styled(format!("{:>8}", "Share"), Style::default().fg(MUTED_COLOR).bold()),
+                Span::raw(" "),
+                Span::styled(format!("{:>12}", "Params"), Style::default().fg(MUTED_COLOR).bold()),
+            ]),
+            Line::from(Span::styled("─".repeat(40), Style::default().fg(BORDER_COLOR))),
+        ];
+        for (name, count, pct) in &categories {
+            let bar = pct_bar_styled(*pct);
+            let spans = vec![
+                Span::styled(format!("{:<14}", name), Style::default().fg(VALUE_COLOR)),
+                Span::raw(" "),
+                Span::styled(format!("{:>7.1}%", pct), Style::default().fg(pct_bar_color(*pct))),
+                Span::raw(" "),
+                Span::styled(format!("{:>12}", human_params(*count)), Style::default().fg(ACCENT_COLOR)),
+            ];
+            lines.push(Line::from(spans));
+            let mut bar_spans = vec![Span::raw("  ")];
+            bar_spans.extend(bar);
+            lines.push(Line::from(bar_spans));
+        }
+        lines.push(Line::from(Span::styled("─".repeat(40), Style::default().fg(BORDER_COLOR))));
+        let total: u64 = categories.iter().map(|(_, c, _)| c).sum();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<14}", "TOTAL"), Style::default().fg(VALUE_COLOR).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
-            Span::styled(format!("{:<26}", truncate(&diff.left, 26)), left_style),
+            Span::styled(format!("{:>8}", ""), Style::default().fg(MUTED_COLOR)),
             Span::raw(" "),
-            Span::styled(format!("{:<26}", truncate(&diff.right, 26)), right_style),
+            Span::styled(format!("{:>12}", human_params(total)), Style::default().fg(ACCENT_COLOR).add_modifier(Modifier::BOLD)),
         ]));
+        lines
+    };
+    tabs.push(CompareTab::Dual {
+        left: TuiSection { title: report.left.model.clone(), lines: make_dist_lines(&report.left) },
+        right: TuiSection { title: report.right.model.clone(), lines: make_dist_lines(&report.right) },
+    });
+
+    // ── Changes (single) ──
+    let (l_p, r_p) = (report.left.params.total_params, report.right.params.total_params);
+    let mut change_lines: Vec<Line<'static>> = Vec::new();
+
+    change_lines.push(Line::from(vec![
+        Span::styled(format!("{:<20}", "Status"), Style::default().fg(MUTED_COLOR).bold()),
+        Span::raw(" "),
+        Span::styled(
+            format!("{changed_count}"),
+            if changed_count > 0 { Style::default().fg(CHANGED_COLOR).add_modifier(Modifier::BOLD) }
+            else { Style::default().fg(Color::Rgb(120, 220, 130)) },
+        ),
+        Span::styled(format!(" / {total_count} metrics differ"), Style::default().fg(MUTED_COLOR)),
+    ]));
+
+    if l_p != r_p {
+        let (arrow, abs) = if r_p > l_p { ("▲", r_p - l_p) } else { ("▼", l_p - r_p) };
+        let pct = if l_p > 0 { (abs as f64 / l_p as f64) * 100.0 } else { 100.0 };
+        let dc = if r_p > l_p { Color::Rgb(120, 220, 130) } else { CHANGED_COLOR };
+        change_lines.push(Line::from(vec![
+            Span::styled(format!("{:<20}", "Param delta"), Style::default().fg(MUTED_COLOR).bold()),
+            Span::raw(" "),
+            Span::styled(human_params(l_p), Style::default().fg(VALUE_COLOR)),
+            Span::styled(" → ", Style::default().fg(MUTED_COLOR)),
+            Span::styled(human_params(r_p), Style::default().fg(VALUE_COLOR)),
+            Span::raw("  "),
+            Span::styled(format!("{arrow} {} ({:.1}%)", human_params(abs), pct), Style::default().fg(dc).add_modifier(Modifier::BOLD)),
+        ]));
+    } else {
+        change_lines.push(kv_line("Param delta", &format!("{} (identical)", human_params(l_p))));
     }
 
-    vec![
-        overview,
-        TuiSection {
-            title: "Metrics".to_string(),
-            lines: metric_lines,
-        },
-    ]
+    if let (Some(ls), Some(rs)) = (report.left.model_size_bytes, report.right.model_size_bytes) {
+        if ls != rs {
+            let (arrow, abs) = if rs > ls { ("▲", rs - ls) } else { ("▼", ls - rs) };
+            let dc = if rs > ls { Color::Rgb(120, 220, 130) } else { CHANGED_COLOR };
+            change_lines.push(Line::from(vec![
+                Span::styled(format!("{:<20}", "Size delta"), Style::default().fg(MUTED_COLOR).bold()),
+                Span::raw(" "),
+                Span::styled(human_bytes(ls), Style::default().fg(VALUE_COLOR)),
+                Span::styled(" → ", Style::default().fg(MUTED_COLOR)),
+                Span::styled(human_bytes(rs), Style::default().fg(VALUE_COLOR)),
+                Span::raw("  "),
+                Span::styled(format!("{arrow} {}", human_bytes(abs)), Style::default().fg(dc).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            change_lines.push(kv_line("Size delta", &format!("{} (identical)", human_bytes(ls))));
+        }
+    }
+
+    let changed_diffs: Vec<_> = report.diffs.iter().filter(|d| d.left != d.right).collect();
+    if !changed_diffs.is_empty() {
+        change_lines.push(Line::from(vec![]));
+        change_lines.push(Line::from(Span::styled(
+            format!("  ⚠ Changed Metrics ({})", changed_diffs.len()),
+            Style::default().fg(WARN_COLOR).add_modifier(Modifier::BOLD),
+        )));
+        change_lines.push(Line::from(Span::styled("╌".repeat(60), Style::default().fg(WARN_COLOR).add_modifier(Modifier::DIM))));
+        for d in &changed_diffs {
+            change_lines.push(Line::from(vec![
+                Span::styled(" ≠ ", Style::default().fg(CHANGED_COLOR).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<18}", truncate(&d.metric, 18)), Style::default().fg(Color::Rgb(255, 220, 100)).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(truncate(&d.left, 20), Style::default().fg(CHANGED_COLOR)),
+                Span::styled(" → ", Style::default().fg(MUTED_COLOR)),
+                Span::styled(truncate(&d.right, 20), Style::default().fg(Color::Rgb(120, 220, 130))),
+            ]));
+        }
+    }
+
+    let same_diffs: Vec<_> = report.diffs.iter().filter(|d| d.left == d.right).collect();
+    if !same_diffs.is_empty() {
+        change_lines.push(Line::from(vec![]));
+        change_lines.push(Line::from(Span::styled(
+            format!("  ✓ Identical Metrics ({})", same_diffs.len()),
+            Style::default().fg(Color::Rgb(120, 220, 130)).add_modifier(Modifier::BOLD),
+        )));
+        change_lines.push(Line::from(Span::styled("╌".repeat(60), Style::default().fg(Color::Rgb(120, 220, 130)).add_modifier(Modifier::DIM))));
+        for d in &same_diffs {
+            change_lines.push(Line::from(vec![
+                Span::styled(" · ", Style::default().fg(SAME_COLOR)),
+                Span::styled(format!("{:<18}", truncate(&d.metric, 18)), Style::default().fg(VALUE_COLOR)),
+                Span::raw(" "),
+                Span::styled(truncate(&d.left, 24), Style::default().fg(SAME_COLOR)),
+            ]));
+        }
+    }
+
+    let mut all_warnings: Vec<String> = Vec::new();
+    for w in &report.left.warnings { all_warnings.push(format!("[Left] {w}")); }
+    for w in &report.right.warnings { all_warnings.push(format!("[Right] {w}")); }
+    if !all_warnings.is_empty() {
+        change_lines.push(Line::from(vec![]));
+        change_lines.push(Line::from(Span::styled("  Warnings", Style::default().fg(WARN_COLOR).add_modifier(Modifier::BOLD))));
+        for w in &all_warnings {
+            change_lines.push(Line::from(Span::styled(format!("  ⚠ {w}"), Style::default().fg(WARN_COLOR))));
+        }
+    }
+
+    tabs.push(CompareTab::Single(TuiSection {
+        title: "Changes".to_string(),
+        lines: change_lines,
+    }));
+
+
+    tabs
+}
+
+
+const GRAPH_BORDER_COLOR: Color = Color::Rgb(80, 130, 200);
+const GRAPH_ARROW_COLOR: Color = Color::Rgb(100, 220, 255);
+const GRAPH_TITLE_COLOR: Color = Color::Rgb(255, 220, 120);
+const GRAPH_COMPONENT_COLOR: Color = Color::Rgb(180, 220, 255);
+const GRAPH_DETAIL_COLOR: Color = Color::Rgb(120, 210, 160);
+const GRAPH_REPEAT_COLOR: Color = Color::Rgb(80, 80, 120);
+const GRAPH_BULLET_COLOR: Color = Color::Rgb(255, 180, 80);
+
+/// Apply rich colorization to a single graph line.
+///
+/// Rules:
+/// - Box-drawing characters (╭╮╯╰│├┤─) → blue border
+/// - Arrows (▼) → cyan accent
+/// - Repeat markers (┊) → muted dim
+/// - Component bullets (○) → orange accent, rest of component text → light blue
+/// - Parenthesized details (e.g., "(GQA, 32 heads)") → green
+/// - Block titles (centered text inside boxes without bullets) → golden
+fn style_graph_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim();
+
+    // Pure arrow line
+    if trimmed == "▼" {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default()
+                .fg(GRAPH_ARROW_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Pure border line (only box-drawing + spaces)
+    if is_pure_border(trimmed) {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default().fg(GRAPH_BORDER_COLOR),
+        ));
+    }
+
+    // Line with component bullets
+    if trimmed.contains('○') {
+        return style_component_line(line);
+    }
+
+    // Line with repeat markers and content
+    if trimmed.starts_with('┊') {
+        return style_repeated_content_line(line);
+    }
+
+    // Line with box borders and text content (title lines)
+    if trimmed.starts_with('│') || trimmed.starts_with("┊") {
+        return style_title_line(line);
+    }
+
+    // Fallback: plain styled
+    Line::from(Span::styled(
+        line.to_string(),
+        Style::default().fg(VALUE_COLOR),
+    ))
+}
+
+fn is_pure_border(s: &str) -> bool {
+    s.chars().all(|c| {
+        matches!(
+            c,
+            '╭' | '╮'
+                | '╯'
+                | '╰'
+                | '│'
+                | '├'
+                | '┤'
+                | '─'
+                | '┊'
+                | ' '
+        )
+    })
+}
+
+fn style_component_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut buffer = String::new();
+
+    // Collect leading characters before the bullet
+    while let Some(&c) = chars.peek() {
+        if c == '○' {
+            break;
+        }
+        buffer.push(c);
+        chars.next();
+    }
+
+    // Style leading portion (repeat markers + borders)
+    if !buffer.is_empty() {
+        spans.push(Span::styled(
+            buffer.clone(),
+            Style::default().fg(GRAPH_BORDER_COLOR),
+        ));
+        buffer.clear();
+    }
+
+    // The bullet itself
+    if chars.peek() == Some(&'○') {
+        spans.push(Span::styled(
+            "○".to_string(),
+            Style::default()
+                .fg(GRAPH_BULLET_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+        chars.next();
+    }
+
+    // Remaining text after bullet
+    let rest: String = chars.collect();
+
+    // Split at parenthesis for detail highlighting
+    if let Some(paren_start) = rest.find('(') {
+        let before_paren = &rest[..paren_start];
+        spans.push(Span::styled(
+            before_paren.to_string(),
+            Style::default().fg(GRAPH_COMPONENT_COLOR),
+        ));
+
+        if let Some(paren_end) = rest[paren_start..].find(')') {
+            let paren_content = &rest[paren_start..paren_start + paren_end + 1];
+            let after_paren = &rest[paren_start + paren_end + 1..];
+
+            spans.push(Span::styled(
+                paren_content.to_string(),
+                Style::default().fg(GRAPH_DETAIL_COLOR),
+            ));
+
+            if !after_paren.is_empty() {
+                // Trailing portion is likely box border chars
+                spans.push(Span::styled(
+                    after_paren.to_string(),
+                    Style::default().fg(GRAPH_BORDER_COLOR),
+                ));
+            }
+        } else {
+            // No closing paren — just style the rest
+            spans.push(Span::styled(
+                rest[paren_start..].to_string(),
+                Style::default().fg(GRAPH_DETAIL_COLOR),
+            ));
+        }
+    } else {
+        // No parens — split at trailing border chars
+        let (text_part, border_part) = split_trailing_border(&rest);
+        spans.push(Span::styled(
+            text_part.to_string(),
+            Style::default().fg(GRAPH_COMPONENT_COLOR),
+        ));
+        if !border_part.is_empty() {
+            spans.push(Span::styled(
+                border_part.to_string(),
+                Style::default().fg(GRAPH_BORDER_COLOR),
+            ));
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn style_repeated_content_line(line: &str) -> Line<'static> {
+    // Lines like: "┊ │   title text   │  ┊"
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut buffer = String::new();
+    let mut in_text = false;
+    let mut text_buf = String::new();
+
+    while let Some(c) = chars.next() {
+        if is_border_char(c) {
+            if in_text && !text_buf.is_empty() {
+                spans.push(Span::styled(
+                    text_buf.clone(),
+                    Style::default()
+                        .fg(GRAPH_TITLE_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                text_buf.clear();
+                in_text = false;
+            }
+            buffer.push(c);
+        } else {
+            if !buffer.is_empty() {
+                let color = if buffer.contains('┊') {
+                    GRAPH_REPEAT_COLOR
+                } else {
+                    GRAPH_BORDER_COLOR
+                };
+                spans.push(Span::styled(buffer.clone(), Style::default().fg(color)));
+                buffer.clear();
+            }
+            in_text = true;
+            text_buf.push(c);
+        }
+    }
+
+    // Flush remaining
+    if !text_buf.is_empty() {
+        spans.push(Span::styled(
+            text_buf,
+            Style::default()
+                .fg(GRAPH_TITLE_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !buffer.is_empty() {
+        let color = if buffer.contains('┊') {
+            GRAPH_REPEAT_COLOR
+        } else {
+            GRAPH_BORDER_COLOR
+        };
+        spans.push(Span::styled(buffer, Style::default().fg(color)));
+    }
+
+    Line::from(spans)
+}
+
+fn style_title_line(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chars = line.chars().peekable();
+    let mut buffer = String::new();
+    let mut in_text = false;
+    let mut text_buf = String::new();
+
+    while let Some(c) = chars.next() {
+        if is_border_char(c) {
+            if in_text && !text_buf.is_empty() {
+                spans.push(Span::styled(
+                    text_buf.clone(),
+                    Style::default()
+                        .fg(GRAPH_TITLE_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                text_buf.clear();
+                in_text = false;
+            }
+            buffer.push(c);
+        } else {
+            if !buffer.is_empty() {
+                spans.push(Span::styled(
+                    buffer.clone(),
+                    Style::default().fg(GRAPH_BORDER_COLOR),
+                ));
+                buffer.clear();
+            }
+            in_text = true;
+            text_buf.push(c);
+        }
+    }
+
+    if !text_buf.is_empty() {
+        spans.push(Span::styled(
+            text_buf,
+            Style::default()
+                .fg(GRAPH_TITLE_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !buffer.is_empty() {
+        spans.push(Span::styled(
+            buffer,
+            Style::default().fg(GRAPH_BORDER_COLOR),
+        ));
+    }
+
+    Line::from(spans)
+}
+
+fn is_border_char(c: char) -> bool {
+    matches!(
+        c,
+        '╭' | '╮'
+            | '╯'
+            | '╰'
+            | '│'
+            | '├'
+            | '┤'
+            | '─'
+            | '┊'
+    )
+}
+
+fn split_trailing_border(s: &str) -> (&str, &str) {
+    // Find the last non-border character position
+    let char_indices: Vec<(usize, char)> = s.char_indices().collect();
+    let mut split_pos = s.len();
+
+    for &(idx, c) in char_indices.iter().rev() {
+        if is_border_char(c) || c == ' ' {
+            split_pos = idx;
+        } else {
+            break;
+        }
+    }
+
+    (&s[..split_pos], &s[split_pos..])
 }
 
 fn kv_line(key: &str, value: &str) -> Line<'static> {

@@ -1,3 +1,4 @@
 /target
 tests/integration_local.rs
 architecture.md
+openVino.md
